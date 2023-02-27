@@ -14,10 +14,28 @@
 //#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <termios.h>
 
 void* capture(void *arg);
+void* finish(void *arg);
 
-timespec diff_timespec(timespec *time1, timespec *time0) {
+int getch(void) {
+	struct termios term, oterm;
+
+	int c = 0;
+
+	tcgetattr(0, &oterm);
+	memcpy(&term, &oterm, sizeof(term));
+	term.c_lflag &= ~(ICANON);
+//	term.c_cc[VMIN] = 1;
+//	term.c_cc[VTIME] = 0;
+	tcsetattr(0, TCSANOW, &term);
+	c = getchar();
+	tcsetattr(0, TCSANOW, &oterm);
+	return c;
+}
+
+timespec timespec_diff(timespec *time1, timespec *time0) {
 
 	assert(time1);
 	assert(time0);
@@ -40,10 +58,10 @@ long timespec_round2u(timespec *val) {
 }
 
 timespec t_period;
-//long loops;
 signed short *buffer;
 FILE *fd;
 snd_pcm_uframes_t frames = 32;
+bool do_finish = false;
 
 int record(char *filename) {
 	int rc;
@@ -61,23 +79,21 @@ int record(char *filename) {
 
 	char *device_name = "default";
 
-	//------------------
+	//--to format time data
 	setlocale(LC_NUMERIC, "");
 
-	struct rlimit limit={99,99};
+	//--to allow rt  priorities
+	struct rlimit limit = { 99, 99 };
 
-	if(setrlimit(RLIMIT_RTPRIO,&limit)!=0){
-		printf("setLimit failed:%m\n"
-				"remember to change hard rtprio limit in /etc/security/limits.conf "
-				"for normal user\n"
-				);
-	}
-	else{
-		printf("limits are:\%d, %d\n",limit.rlim_cur,limit.rlim_max);
+	if (setrlimit(RLIMIT_RTPRIO, &limit) != 0) {
+		printf(
+				"setLimit failed:%m\n"
+						"remember to change hard rtprio limit to 99 in /etc/security/limits.conf "
+						"for normal user\n");
+	} else {
+		printf("limits are:\%d, %d\n", limit.rlim_cur, limit.rlim_max);
 	}
 	//------------------
-
-
 
 	fd = fopen(filename, "w");
 	if (fd == NULL) {
@@ -113,7 +129,7 @@ int record(char *filename) {
 
 	struct sched_param param;
 	pthread_attr_t attr;
-	pthread_t thread;
+	pthread_t thread_capturing;
 	int ret;
 
 	/* Lock memory */
@@ -142,7 +158,7 @@ int record(char *filename) {
 		printf("pthread setschedpolicy failed\n");
 		goto out;
 	}
-	param.sched_priority = 80;
+	param.sched_priority = 98;
 	ret = pthread_attr_setschedparam(&attr, &param);
 	if (ret) {
 		printf("pthread setschedparam failed\n");
@@ -155,21 +171,23 @@ int record(char *filename) {
 		goto out;
 	}
 
+	/*Running thread waiting for console input to break programm*/
+	pthread_t thread_finish;
+	ret = pthread_create(&thread_finish, NULL, finish, NULL);
+
 	/* Create a pthread with specified attributes */
-	ret = pthread_create(&thread, &attr, capture, pcm);
+	ret = pthread_create(&thread_capturing, &attr, capture, pcm);
 	if (ret) {
 		printf("create pthread failed: %d\n", ret);
 		goto out;
 	}
 
 	/* Join the thread and wait until it is done */
-	ret = pthread_join(thread, NULL);
+	ret = pthread_join(thread_capturing, NULL);
 	if (ret)
 		printf("join pthread failed: %m\n");
 
-	out:
-
-	close(fileno(fd));
+	out: close(fileno(fd));
 
 	snd_pcm_drop(pcm);
 	snd_pcm_close(pcm);
@@ -179,29 +197,42 @@ int record(char *filename) {
 
 }
 
+void* finish(void *arg) {
+	printf("press q to exit\n");
+
+	while (1) {
+		int c = getch();
+		if (c == 'q') {
+			do_finish = true;
+			int ret = 0;
+			pthread_exit(&ret);
+		}
+	}
+}
+
 void* capture(void *arg) {
 
 	snd_pcm_t *pcm = (snd_pcm_t*) arg;
 	int rc;
-	int loops = 500000;
 
 	snd_pcm_uframes_t avail;
 	timespec t_start, t_end;
 	timespec t_start_old, t_diff;
+	unsigned long loops = 0;
 
 	rc = snd_pcm_start(pcm);
 	if (rc < 0) {
 		fprintf(stderr, "error starting: %s\n", snd_strerror(rc));
 	}
 
-	while (loops > 0) {
+	while (!do_finish) {
 
 		clock_gettime(CLOCK_MONOTONIC, &t_start);
-		loops--;
+		loops++;
 
 		avail = snd_pcm_avail(pcm);
 
-		t_diff = diff_timespec(&t_start, &t_start_old);
+		t_diff = timespec_diff(&t_start, &t_start_old);
 		fprintf(stdout, "loop:%ld, available frames:%ld, at time_diff:%'ld\n",
 				loops, avail, timespec_round2u(&t_diff));
 		t_start_old = t_start;
@@ -228,10 +259,10 @@ void* capture(void *arg) {
 
 		clock_gettime(CLOCK_MONOTONIC, &t_end);
 
-		timespec t_elapsed = diff_timespec(&t_end, &t_start);
+		timespec t_elapsed = timespec_diff(&t_end, &t_start);
 		printf("loop:%ld, elapsed:%'ld\n", loops, timespec_round2u(&t_elapsed));
 
-		timespec t_remains = diff_timespec(&t_period, &t_elapsed);
+		timespec t_remains = timespec_diff(&t_period, &t_elapsed);
 		printf("loop:%ld, remains:%'ld\n", loops, timespec_round2u(&t_remains));
 		if (t_remains.tv_sec == 0) {
 
@@ -242,7 +273,7 @@ void* capture(void *arg) {
 			}
 		}
 		clock_gettime(CLOCK_MONOTONIC, &t_end);
-		t_elapsed = diff_timespec(&t_end, &t_start);
+		t_elapsed = timespec_diff(&t_end, &t_start);
 
 		printf("loop:%ld. time diff start to end after sleep: %ld\n\n", loops,
 				timespec_round2u(&t_elapsed));

@@ -6,11 +6,11 @@
 // Description : Hello World in C++, Ansi-style
 //============================================================================
 
-#include <cstdio>
+#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-int playback(char *);
-int record(char *);
+int playback(char*);
+int record(char*);
 
 int main(int argc, char *argv[]) {
 
@@ -18,15 +18,12 @@ int main(int argc, char *argv[]) {
 	//setvbuf(stderr, NULL, _IONBF, 0);
 	int opt;
 
+	char *filename = "sound.raw";
 
-	char *filename;
-	if(optind<argc){
-		filename=argv[optind+1];
-	}
-	else{
-		printf("Podaj nazwe pliku.");
-		exit(0);
-	}
+/*	if (optind < argc) {
+		filename = argv[optind + 1];
+	}*/
+
 	while ((opt = getopt(argc, argv, "rp")) != -1) {
 
 		switch (opt) {
@@ -35,16 +32,18 @@ int main(int argc, char *argv[]) {
 			record(filename);
 			break;
 		case 'p':
-			printf("Odtwarzam\n");
+			printf("Odtwarzam %s\n",filename);
 			playback(filename);
 			break;
+
 		}
 	}
 
-	//  display_pcm_types();
-	// capture();
-	//playback();
-	//prepare_recording();
+	if (argc == 1) {
+		printf("Nagrywam\n");
+		record(filename);
+	}
+
 	printf("Dziekuje\n");
 	exit(0);
 }

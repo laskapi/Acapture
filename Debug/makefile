@@ -55,7 +55,7 @@ main-build: acapture
 acapture: $(OBJS) $(USER_OBJS) makefile $(OPTIONAL_TOOL_DEPS)
 	@echo 'Building target: $@'
 	@echo 'Invoking: GCC C++ Linker'
-	g++ -L/usr/lib/asound -o "acapture" $(OBJS) $(USER_OBJS) $(LIBS) -lasound
+	g++ -L/usr/lib/asound -pg -pthread -o "acapture" $(OBJS) $(USER_OBJS) $(LIBS) -lasound
 	@echo 'Finished building target: $@'
 	@echo ' '
 

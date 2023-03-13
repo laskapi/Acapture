@@ -14,16 +14,22 @@
 
 #include"malsa.h"
 
+static void capture_params_set(capture_params *c_params);
+static int rt_thread_start(pthread_t *thread, void* (*thread_function)(void*),
+		void *thread_params, int priority);
+static int rt_init();
+static void* capture(void *arg);
+static void* consume(void *arg);
+static void* finish(void *arg);
 
-
-bool operator <(const timespec &lhs, const timespec &rhs) {
+static bool operator <(const timespec &lhs, const timespec &rhs) {
 	if (lhs.tv_sec == rhs.tv_sec)
 		return lhs.tv_nsec < rhs.tv_nsec;
 	else
 		return lhs.tv_sec < rhs.tv_sec;
 }
 
-int getch(void) {
+static int getch(void) {
 	struct termios term, oterm;
 
 	int c = 0;
@@ -37,7 +43,7 @@ int getch(void) {
 	return c;
 }
 
-timespec timespec_diff(timespec *time1, timespec *time0) {
+static timespec timespec_diff(timespec *time1, timespec *time0) {
 
 	assert(time1);
 	assert(time0);
@@ -53,13 +59,11 @@ timespec timespec_diff(timespec *time1, timespec *time0) {
 
 }
 
-long timespec_round2u(timespec *val) {
+static long timespec_round2u(timespec *val) {
 
 	long nsec = val->tv_nsec;
 	return (nsec < 0) ? ((nsec - 1000 / 2) / 1000) : ((nsec + 1000 / 2) / 1000);
 }
-
-
 
 int record(char *filename) {
 
@@ -78,17 +82,21 @@ int record(char *filename) {
 		return 1;
 	}
 
-	struct capture_params c_params;
-	capture_params_set(&c_params);
-	c_params.fd = fd;
+	struct capture_params cap_params;
+	capture_params_set(&cap_params);
+	cap_params.fd = fd;
+
+	struct consume_params con_params;
+	con_params.fd = fd;
+	con_params.buffer = cap_params.buffer;
 
 	/*Running rt consuming thread*/
 	pthread_t thread_consuming;
-	rt_thread_start(&thread_consuming, consume, &c_params.buffer, 98);
+	rt_thread_start(&thread_consuming, consume, &con_params, 98);
 
 	/*Running capturing thread*/
 	pthread_t thread_capturing;
-	ret = pthread_create(&thread_capturing, NULL, capture2, &c_params);
+	ret = pthread_create(&thread_capturing, NULL, capture, &cap_params);
 
 	/*Running thread waiting for console input to break program*/
 	pthread_t thread_quitting;
@@ -102,37 +110,15 @@ int record(char *filename) {
 	pthread_cancel(thread_consuming);
 	close(fileno(fd));
 
-	snd_pcm_drop(c_params.pcm);
-	snd_pcm_close(c_params.pcm);
-	free(c_params.buffer);
+	snd_pcm_drop(cap_params.pcm);
+	snd_pcm_close(cap_params.pcm);
+	free(cap_params.buffer);
 
 	return ret;
 
 }
 
-
-
-
-
-
-int rt_init() {
-	//--to allow rt  priorities
-	struct rlimit limit = { 99, 99 };
-
-	if (setrlimit(RLIMIT_RTPRIO, &limit) != 0) {
-		printf(
-				"setLimit failed:%m\n"
-						"remember to change hard rtprio limit to 99 in /etc/security/limits.conf "
-						"for normal user\n");
-		return -1;
-	} else {
-		printf("limits are:\%d, %d\n", limit.rlim_cur, limit.rlim_max);
-		return 0;
-	}
-
-}
-
-void capture_params_set(capture_params *c_params) {
+static void capture_params_set(capture_params *c_params) {
 	int rc;
 	int size;
 	unsigned int val;
@@ -144,11 +130,11 @@ void capture_params_set(capture_params *c_params) {
 	snd_pcm_access_t access = SND_PCM_ACCESS_RW_INTERLEAVED;
 	snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
 	u_int channels = 2;
-	u_int sample_rate = 48000;
+	u_int sample_rate = 8000;
 	char *device_name = "default";
 
 	rc = snd_pcm_open(&pcm, device_name, SND_PCM_STREAM_CAPTURE,
-	SND_PCM_NONBLOCK);
+/*	SND_PCM_NONBLOCK*/0);
 	if (rc < 0) {
 		fprintf(stderr, "unable to open pcm device: %s\n", snd_strerror(rc));
 
@@ -184,7 +170,24 @@ void capture_params_set(capture_params *c_params) {
 
 }
 
-int rt_thread_start(pthread_t *thread, void* (*thread_function)(void*),
+static int rt_init() {
+	//--to allow rt  priorities
+	struct rlimit limit = { 99, 99 };
+
+	if (setrlimit(RLIMIT_RTPRIO, &limit) != 0) {
+		printf(
+				"setLimit failed:%m\n"
+						"remember to change hard rtprio limit to 99 in /etc/security/limits.conf "
+						"for normal user\n");
+		return -1;
+	} else {
+		printf("limits are:\%d, %d\n", limit.rlim_cur, limit.rlim_max);
+		return 0;
+	}
+
+}
+
+static int rt_thread_start(pthread_t *thread, void* (*thread_function)(void*),
 		void *thread_params, int priority) {
 	struct sched_param param;
 	pthread_attr_t attr;
@@ -238,14 +241,17 @@ int rt_thread_start(pthread_t *thread, void* (*thread_function)(void*),
 	return 0;
 }
 
-void* consume(void *data_buffer) {
-	signed short *buffer = (short*) data_buffer;
+static void* consume(void *con_params) {
+
+	signed short *buffer = ((consume_params*) con_params)->buffer;
+	int fd = fileno(((consume_params*) con_params)->fd);
 	timespec t_wake;
 	const int PERIOD_NS = 1000;
 
 	while (1) {
 		clock_gettime(CLOCK_MONOTONIC, &t_wake);
-		printf("Consumer wake time:%'lld.%'lld, ", t_wake.tv_sec, t_wake.tv_nsec);
+		printf("Consumer wake time:%'lld.%'lld, ", t_wake.tv_sec,
+				t_wake.tv_nsec);
 		t_wake.tv_nsec += PERIOD_NS;
 		if (t_wake.tv_nsec > 1000000000) {
 			t_wake.tv_sec += 1;
@@ -254,15 +260,16 @@ void* consume(void *data_buffer) {
 
 		int i = 0;
 
-		printf("buffer read:%d: ", buffer_read);
+		printf("Consumer buffer read:%d: ", buffer_read);
 
 		while (i < buffer_read) {
 			printf("%d,", buffer[i]);
 			i++;
 		}
-		printf("\n");
+		int rc=write(fd, buffer, buffer_read*4);
 		buffer_read = 0;
 
+		printf("\n wrote %d bytes\n",rc);
 
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t_wake, NULL);
 	}
@@ -270,7 +277,7 @@ void* consume(void *data_buffer) {
 
 }
 
-void* finish(void *arg) {
+static void* finish(void *arg) {
 	printf("press q to exit\n");
 
 	while (1) {
@@ -283,7 +290,81 @@ void* finish(void *arg) {
 	}
 }
 
-void* capture2(void *arg) {
+static void* capture(void *arg) {
+	struct capture_params *c_params = (capture_params*) arg;
+	int rc, avail;
+	struct timespec t_start, t_end, t_old, t_diff, t_wake;
+	unsigned long loops;
+	rc = snd_pcm_start(c_params->pcm);
+	while (!do_finish || avail>0) {
+		loops++;
+		if (do_finish){
+			printf("avail:%d\n",avail);
+					snd_pcm_drain(c_params->pcm);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &t_start);
+
+		avail = snd_pcm_avail(c_params->pcm);
+
+		t_diff = timespec_diff(&t_start, &t_old);
+		t_old = t_start;
+		fprintf(stdout,
+				"\nloop:%ld, available frames:%ld, at time_diff:%'ld ns\n",
+				loops, avail, t_diff.tv_nsec);
+
+		while (avail == 0 || buffer_read!=0) {
+			t_wake.tv_sec = t_start.tv_sec;
+			t_wake.tv_nsec = t_start.tv_nsec + c_params->t_period.tv_nsec;
+			if (t_wake.tv_nsec > 1000000000) {
+				t_wake.tv_sec++;
+				t_wake.tv_nsec -= 1000000000;
+			}
+
+			clock_gettime(CLOCK_MONOTONIC, &t_end);
+			t_diff = timespec_diff(&t_end, &t_start);
+			printf("loop: %ld, sleeping %'ld\n", loops, t_diff.tv_nsec);
+			rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t_wake, NULL);
+			if (rc < 0) {
+				fprintf(stdout, "loop:%ld, error sleeping: %s\n", loops, rc);
+			}
+			avail = snd_pcm_avail(c_params->pcm);
+
+		}
+
+		int amount_to_read;
+		(c_params->frames) < avail ?
+				amount_to_read = c_params->frames : amount_to_read = avail;
+		rc = snd_pcm_readi(c_params->pcm, c_params->buffer, amount_to_read);
+		buffer_read = rc;
+
+	//	write(fileno(c_params->fd), c_params->buffer, rc*4);
+
+		if (rc < 0) {
+			fprintf(stdout, "loop: %ld, cant read frames: %s\n", loops,
+					snd_strerror(rc));
+
+		} else {
+			fprintf(stdout, "loop: %ld, read frames: %d\n", loops, rc);
+
+		}
+
+		t_wake.tv_sec = t_start.tv_sec;
+		t_wake.tv_nsec = t_start.tv_nsec + c_params->t_period.tv_nsec;
+		if (t_wake.tv_nsec > 1000000000) {
+			t_wake.tv_sec++;
+			t_wake.tv_nsec -= 1000000000;
+		}
+
+		clock_gettime(CLOCK_MONOTONIC, &t_end);
+		t_diff = timespec_diff(&t_end, &t_start);
+		printf("loop: %ld, took %'ld\n", loops, t_diff.tv_nsec);
+
+	}
+	return 0;
+
+}
+
+static void* capture1(void *arg) {
 	struct capture_params *c_params = (capture_params*) arg;
 	int rc, avail;
 	struct timespec t_start, t_end, t_old, t_diff, t_wake;
@@ -302,8 +383,14 @@ void* capture2(void *arg) {
 				"\nloop:%ld, available frames:%ld, at time_diff:%'ld ns\n",
 				loops, avail, t_diff.tv_nsec);
 
-		rc = snd_pcm_readi(c_params->pcm, c_params->buffer, c_params->frames);
+		int amount_to_read;
+		(c_params->frames) < avail ?
+				amount_to_read = c_params->frames : amount_to_read = avail;
+		rc = snd_pcm_readi(c_params->pcm, c_params->buffer, amount_to_read);
 		buffer_read = rc;
+
+		write(fileno(c_params->fd), c_params->buffer, buffer_read);
+
 		if (rc < 0) {
 			fprintf(stdout, "loop: %ld, cant read frames: %s\n", loops,
 					snd_strerror(rc));
@@ -315,143 +402,33 @@ void* capture2(void *arg) {
 
 		t_wake.tv_sec = t_start.tv_sec;
 		t_wake.tv_nsec = t_start.tv_nsec + c_params->t_period.tv_nsec;
+		if (t_wake.tv_nsec > 1000000000) {
+			t_wake.tv_sec++;
+			t_wake.tv_nsec -= 1000000000;
+		}
 
 		clock_gettime(CLOCK_MONOTONIC, &t_end);
 		t_diff = timespec_diff(&t_end, &t_start);
 		printf("loop: %ld, took %'ld\n", loops, t_diff.tv_nsec);
 
-		if (t_end < t_wake) {
-			rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t_wake, NULL);
-			if (rc < 0) {
-				fprintf(stdout, "loop:%ld, error sleeping: %s\n", loops,
-						strerror(errno));
-			} else {
-				printf("loop: %ld should wake up at  %'ld.%'ld \n", loops,
-						t_wake.tv_sec, t_wake.tv_nsec);
+		/*if (t_end < t_wake) {
+		 rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t_wake, NULL);
+		 if (rc < 0) {
+		 fprintf(stdout, "loop:%ld, error sleeping: %s\n", loops,
+		 strerror(errno));
+		 } else {
+		 printf("loop: %ld should wake up at  %'ld.%'ld \n", loops,
+		 t_wake.tv_sec, t_wake.tv_nsec);
 
-				clock_gettime(CLOCK_MONOTONIC, &t_end);
-				printf("loop: %ld, woke up at %'ld.%'ld\n", loops, t_end.tv_sec,
-						t_end.tv_nsec);
+		 clock_gettime(CLOCK_MONOTONIC, &t_end);
+		 printf("loop: %ld, woke up at %'ld.%'ld\n", loops, t_end.tv_sec,
+		 t_end.tv_nsec);
 
-			}
+		 }
 
-		}
+		 }*/
 	}
 	return 0;
 
-}
-
-void* capture1(void *arg) {
-	struct capture_params *c_params = (capture_params*) arg;
-	int rc, avail;
-	unsigned long loops = 0;
-	struct timespec t_start, t_old, t_diff, t_period;
-
-	t_period.tv_sec = 0;
-	t_period.tv_nsec = (1000 * 1000 * 1000) / 48000;
-
-	printf("t_period=%ld\n", timespec_round2u(&t_period));
-	rc = snd_pcm_start(c_params->pcm);
-	while (!do_finish) {
-
-		loops++;
-
-		clock_gettime(CLOCK_MONOTONIC, &t_start);
-
-		avail = snd_pcm_avail(c_params->pcm);
-
-		t_diff = timespec_diff(&t_start, &t_old);
-		t_old = t_start;
-		fprintf(stdout, "loop:%ld, available frames:%ld, at time_diff:%'ld\n",
-				loops, avail, timespec_round2u(&t_diff));
-
-		rc = snd_pcm_readi(c_params->pcm, c_params->buffer, 1);
-		if (rc < 0) {
-			fprintf(stdout, "loop: %ld, cant read frames: %s\n", loops,
-					snd_strerror(rc));
-
-		} else {
-			fprintf(stdout, "loop: %ld, read frames: %d\n", loops, rc);
-			write(fileno(c_params->fd), c_params->buffer, rc * 4);
-			/*	if (rc < avail) {
-			 continue;
-			 }
-			 */
-		}
-
-	}
-	return 0;
-}
-
-void* capture(void *arg) {
-	struct capture_params *c_params = (capture_params*) arg;
-	int rc;
-	unsigned long loops = 0;
-
-	snd_pcm_uframes_t avail;
-	struct timespec t_start, t_end;
-	struct timespec t_start_old, t_diff;
-
-	rc = snd_pcm_start(c_params->pcm);
-	if (rc < 0) {
-		fprintf(stderr, "error starting: %s\n", snd_strerror(rc));
-	}
-
-	while (!do_finish) {
-
-		clock_gettime(CLOCK_MONOTONIC, &t_start);
-		loops++;
-
-		avail = snd_pcm_avail(c_params->pcm);
-
-		t_diff = timespec_diff(&t_start, &t_start_old);
-		fprintf(stdout, "loop:%ld, available frames:%ld, at time_diff:%'ld\n",
-				loops, avail, timespec_round2u(&t_diff));
-		t_start_old = t_start;
-
-		if (avail > 0) {
-
-			int count = (avail > c_params->frames) ? c_params->frames : avail;
-
-			rc = snd_pcm_readi(c_params->pcm, c_params->buffer, count);
-			if (rc < 0) {
-				fprintf(stdout, "loop: %ld, cant read frames: %s\n", loops,
-						snd_strerror(rc));
-
-			} else {
-				fprintf(stdout, "loop: %ld, read frames: %d\n", loops, rc);
-				write(fileno(c_params->fd), c_params->buffer, rc * 4);
-				if (rc < avail) {
-					continue;
-				}
-
-			}
-
-		}
-
-		clock_gettime(CLOCK_MONOTONIC, &t_end);
-
-		timespec t_elapsed = timespec_diff(&t_end, &t_start);
-		printf("loop:%ld, elapsed:%'ld\n", loops, timespec_round2u(&t_elapsed));
-
-		timespec t_remains = timespec_diff(&c_params->t_period, &t_elapsed);
-		printf("loop:%ld, remains:%'ld\n", loops, timespec_round2u(&t_remains));
-		if (t_remains.tv_sec == 0) {
-
-			rc = nanosleep(&t_remains, NULL);
-			if (rc < 0) {
-				fprintf(stdout, "loop:%ld, error sleeping: %s\n", loops,
-						strerror(errno));
-			}
-		}
-		clock_gettime(CLOCK_MONOTONIC, &t_end);
-		t_elapsed = timespec_diff(&t_end, &t_start);
-
-		printf("loop:%ld. time diff start to end after sleep: %ld\n\n", loops,
-				timespec_round2u(&t_elapsed));
-
-	}
-
-	return 0;
 }
 
